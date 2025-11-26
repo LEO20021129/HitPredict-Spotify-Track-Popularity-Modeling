@@ -16,7 +16,7 @@ Beyond prediction, the project also explores **which song characteristics are as
 
 ---
 
-### Data
+### Data (A public kaggle Dataset: https://www.kaggle.com/datasets/maharshipandya/-spotify-tracks-dataset?resource=download)
 
 - ~114,000 tracks from Spotify with:
   - **Target (regression):** `popularity` (0–100)
