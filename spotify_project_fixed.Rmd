@@ -1,0 +1,887 @@
+---
+title: "STSCI 5740 Final Project: Spotify Popularity Prediction"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    theme: readable
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE
+)
+set.seed(123)
+```
+
+
+
+# 2 Data Description and Pre-processing
+
+## 2.1 Load and inspect data
+
+```{r load-data}
+# Packages
+library(tidyverse)
+library(caret)
+library(MASS)        # LDA, QDA
+library(glmnet)      # ridge, lasso
+library(pls)         # PCR
+library(corrplot)    # correlation heatmap
+library(rpart)       # trees
+library(rpart.plot)
+library(randomForest)
+library(gbm)
+library(e1071)       # Naive Bayes
+library(pROC)       # ROC, AUC
+
+# Read data (assumes dataset.csv is in working directory)
+spotify_raw <- read_csv("dataset.csv")
+
+glimpse(spotify_raw)
+summary(spotify_raw$popularity)
+```
+
+
+## 2.2 Basic cleaning
+
+```{r clean-data}
+spotify <- spotify_raw %>%
+  # Drop index column if present
+  dplyr::select(-any_of("Unnamed: 0")) %>%
+  # Remove duplicates
+  distinct() %>%
+  # Remove rows with missing key variables
+  filter(
+    !is.na(popularity),
+    !is.na(danceability),
+    !is.na(energy),
+    !is.na(loudness),
+    !is.na(valence)
+  )
+
+# Convert to factors where appropriate
+spotify <- spotify %>%
+  mutate(
+    explicit       = factor(explicit, levels = c(0, 1),
+                            labels = c("Non-explicit", "Explicit")),
+    key            = factor(key),
+    mode           = factor(mode),
+    time_signature = factor(time_signature),
+    track_genre    = factor(track_genre)
+  )
+
+# List of numeric predictors
+num_vars <- c(
+  "duration_ms", "danceability", "energy", "loudness",
+  "speechiness", "acousticness", "instrumentalness",
+  "liveness", "valence", "tempo"
+)
+
+# All predictors we will use (excluding text fields like track_name, artists)
+pred_vars <- c(
+  num_vars,
+  "explicit", "key", "mode", "time_signature", "track_genre"
+)
+```
+
+## 2.3 Create classification label and train/test split
+
+```{r split-data}
+# High vs Low popularity label (threshold can be adjusted)
+spotify <- spotify %>%
+  mutate(
+    high_pop = if_else(popularity >= 60, "High", "Low"),
+    high_pop = factor(high_pop, levels = c("High", "Low"))
+  )
+
+# Train / test split
+set.seed(123)
+train_index <- createDataPartition(spotify$popularity, p = 0.7, list = FALSE)
+spotify_train <- spotify[train_index, ]
+spotify_test  <- spotify[-train_index, ]
+
+# Regression datasets
+train_reg <- spotify_train %>%
+  dplyr::select(popularity, all_of(pred_vars))
+
+test_reg <- spotify_test %>%
+  dplyr::select(popularity, all_of(pred_vars))
+
+# Classification datasets
+train_cl <- spotify_train %>%
+  dplyr::select(high_pop, all_of(pred_vars))
+
+test_cl <- spotify_test %>%
+  dplyr::select(high_pop, all_of(pred_vars))
+```
+
+# 3 Exploratory Data Analysis (EDA)
+
+## 3.1 Distributions and summary
+
+```{r eda-univariate, fig.height=5, fig.width=7}
+# Popularity distribution
+ggplot(spotify, aes(x = popularity)) +
+  geom_histogram(bins = 30) +
+  labs(
+    title = "Distribution of Popularity",
+    x = "Popularity",
+    y = "Count"
+  )
+```
+
+```{r eda-numeric-features, fig.height=6, fig.width=8}
+# Distributions of numeric audio features
+spotify %>%
+  dplyr::select(all_of(num_vars)) %>%
+  pivot_longer(everything(),
+               names_to = "variable",
+               values_to = "value") %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30) +
+  facet_wrap(~variable, scales = "free") +
+  labs(
+    title = "Distributions of Numeric Audio Features",
+    x = NULL,
+    y = "Count"
+  )
+```
+
+## 3.2 Popularity vs audio features
+
+```{r eda-bivariate, fig.height=6, fig.width=8}
+spotify %>%
+  dplyr::select(popularity, danceability, energy, loudness, valence) %>%
+  pivot_longer(-popularity,
+               names_to = "feature",
+               values_to = "value") %>%
+  ggplot(aes(x = value, y = popularity)) +
+  geom_point(alpha = 0.1) +
+  facet_wrap(~feature, scales = "free_x") +
+  labs(
+    title = "Popularity vs Selected Audio Features",
+    x = "Feature value",
+    y = "Popularity"
+  )
+```
+
+## 3.3 Popularity by explicit status and genre
+
+```{r eda-explicit, fig.height=4, fig.width=6}
+ggplot(spotify, aes(x = explicit, y = popularity)) +
+  geom_boxplot() +
+  labs(
+    title = "Popularity by Explicit Status",
+    x = "Explicit",
+    y = "Popularity"
+  )
+```
+
+```{r eda-genre, fig.height=6, fig.width=7}
+top_genres <- spotify %>%
+  count(track_genre, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(track_genre)
+
+spotify %>%
+  filter(track_genre %in% top_genres) %>%
+  ggplot(aes(
+    x = fct_reorder(track_genre, popularity, .fun = median),
+    y = popularity
+  )) +
+  geom_boxplot() +
+  coord_flip() +
+  labs(
+    title = "Popularity by Top 10 Genres",
+    x = "Genre",
+    y = "Popularity"
+  )
+```
+
+## 3.4 Correlation matrix
+
+```{r eda-corr, fig.height=6, fig.width=6}
+cor_mat <- spotify %>%
+  dplyr::select(popularity, all_of(num_vars)) %>%
+  cor(use = "complete.obs")
+
+corrplot(cor_mat, method = "color", type = "upper", tl.cex = 0.7)
+```
+
+# 4 Regression Models for Predicting Popularity
+
+```{r reg-metric-helper}
+# Helper for regression metrics
+reg_metrics <- function(pred, obs, model_name) {
+  as.data.frame(t(postResample(pred = pred, obs = obs))) %>%
+    mutate(Model = model_name, .before = 1)
+}
+
+y_test <- test_reg$popularity
+```
+
+## 4.1 Baseline Linear Regression
+
+```{r lm-baseline}
+# Simple linear regression (popularity ~ danceability)
+lm_simple <- lm(popularity ~ danceability, data = train_reg)
+summary(lm_simple)
+
+# Diagnostics
+par(mfrow = c(2, 2))
+plot(lm_simple)
+par(mfrow = c(1, 1))
+
+pred_lm_simple <- predict(lm_simple, newdata = test_reg)
+perf_lm_simple <- reg_metrics(pred_lm_simple, y_test,
+                              "LM simple (popularity ~ danceability)")
+perf_lm_simple
+```
+
+```{r lm-full}
+# Full multiple linear regression with all predictors
+lm_full <- lm(popularity ~ ., data = train_reg)
+summary(lm_full)
+
+pred_lm_full <- predict(lm_full, newdata = test_reg)
+perf_lm_full <- reg_metrics(pred_lm_full, y_test, "LM full")
+perf_lm_full
+```
+
+## 4.2 Stepwise Model Selection (AIC, BIC)
+
+```{r stepwise}
+n_train <- nrow(train_reg)
+
+# Stepwise AIC
+step_aic <- stepAIC(lm_full, direction = "both", trace = FALSE)
+summary(step_aic)
+
+pred_step_aic <- predict(step_aic, newdata = test_reg)
+perf_step_aic <- reg_metrics(pred_step_aic, y_test, "Stepwise AIC")
+
+# Stepwise BIC (k = log(n))
+step_bic <- stepAIC(lm_full, direction = "both",
+                    k = log(n_train), trace = FALSE)
+summary(step_bic)
+
+pred_step_bic <- predict(step_bic, newdata = test_reg)
+perf_step_bic <- reg_metrics(pred_step_bic, y_test, "Stepwise BIC")
+
+perf_step_aic
+perf_step_bic
+```
+
+## 4.3 Ridge and Lasso Regression
+
+```{r ridge-lasso}
+# Model matrices for glmnet
+x_train <- model.matrix(popularity ~ ., data = train_reg)[, -1]
+x_test  <- model.matrix(popularity ~ ., data = test_reg)[, -1]
+y_train <- train_reg$popularity
+
+# Ridge
+set.seed(123)
+cv_ridge <- cv.glmnet(x_train, y_train,
+                      alpha = 0, standardize = TRUE, nfolds = 5)
+
+pred_ridge <- predict(cv_ridge, s = "lambda.min", newx = x_test)
+perf_ridge <- reg_metrics(pred_ridge[, 1], y_test, "Ridge regression")
+
+# Lasso
+set.seed(123)
+cv_lasso <- cv.glmnet(x_train, y_train,
+                      alpha = 1, standardize = TRUE, nfolds = 5)
+
+pred_lasso <- predict(cv_lasso, s = "lambda.min", newx = x_test)
+perf_lasso <- reg_metrics(pred_lasso[, 1], y_test, "Lasso regression")
+
+# Lasso coefficients at optimal lambda
+lasso_coef <- coef(cv_lasso, s = "lambda.min")
+lasso_coef
+```
+
+## 4.4 Principal Component Regression (PCR)
+
+```{r pcr}
+set.seed(123)
+pcr_fit <- pcr(popularity ~ ., data = train_reg,
+               scale = TRUE, validation = "CV")
+
+summary(pcr_fit)
+validationplot(pcr_fit, val.type = "RMSEP")
+
+# Choose number of components using one-standard-error rule
+ncomp_opt <- selectNcomp(pcr_fit, method = "onesigma", plot = FALSE)
+ncomp_opt
+
+pred_pcr <- predict(pcr_fit, newdata = test_reg, ncomp = ncomp_opt)
+perf_pcr <- reg_metrics(pred_pcr[, 1, 1], y_test,
+                        paste0("PCR (", ncomp_opt, " comps)"))
+perf_pcr
+```
+
+## 4.5 k-Nearest Neighbors Regression
+
+```{r knn-reg}
+set.seed(123)
+
+# Safety check: make sure previous objects exist
+stopifnot(exists("train_reg"), exists("test_reg"), exists("y_test"))
+
+# Use a smaller training sample for kNN (much faster)
+n_train_max <- 3000   # change to 2000 / 5000 as you like
+train_reg_knn <- if (nrow(train_reg) > n_train_max) {
+  dplyr::sample_n(train_reg, n_train_max)
+} else {
+  train_reg
+}
+
+# Lighter cross-validation setup
+ctrl_reg <- trainControl(
+  method      = "cv",
+  number      = 3,          # 3-fold CV instead of 5
+  verboseIter = TRUE        # prints progress messages
+)
+
+knn_reg_fit <- train(
+  popularity ~ .,
+  data       = train_reg_knn,
+  method     = "knn",
+  trControl  = ctrl_reg,
+  preProcess = c("center", "scale"),
+  tuneGrid   = data.frame(k = c(5, 15, 25))  # only 3 k values
+)
+
+knn_reg_fit
+
+# Evaluate on full test set
+pred_knn_reg <- predict(knn_reg_fit, newdata = test_reg)
+perf_knn_reg <- reg_metrics(
+  pred_knn_reg,
+  y_test,
+  paste0("kNN regression (subsampled, n_train = ", nrow(train_reg_knn), ")")
+)
+perf_knn_reg
+```
+
+## 4.6 Tree-based Regression: CART, Random Forest, GBM
+
+```{r tree-reg}
+# Regression tree
+set.seed(123)
+tree_reg <- rpart(popularity ~ ., data = train_reg,
+                  method = "anova",
+                  control = rpart.control(cp = 0.001))
+
+printcp(tree_reg)
+plotcp(tree_reg)
+
+opt_cp <- tree_reg$cptable[which.min(tree_reg$cptable[, "xerror"]), "CP"]
+tree_reg_pruned <- prune(tree_reg, cp = opt_cp)
+
+rpart.plot(tree_reg_pruned, main = "Pruned Regression Tree")
+
+pred_tree_reg <- predict(tree_reg_pruned, newdata = test_reg)
+perf_tree_reg <- reg_metrics(pred_tree_reg, y_test, "Regression tree (pruned)")
+perf_tree_reg
+```
+
+```{r rf-gbm-reg}
+# Random Forest (with subsampling + reduced genre levels)
+library(forcats)
+
+set.seed(123)
+
+## 1. Subsample training data to speed up RF
+n_rf_max <- 20000   # change to 10000 or 5000 if still too slow
+train_reg_rf <- if (nrow(train_reg) > n_rf_max) {
+  dplyr::sample_n(train_reg, n_rf_max)
+} else {
+  train_reg
+}
+
+## 2. Identify top 50 genres in *subsampled* training data (as character)
+top_genres_rf <- train_reg_rf %>%
+  dplyr::count(track_genre, sort = TRUE) %>%
+  dplyr::slice_head(n = 50) %>%
+  dplyr::pull(track_genre) %>%
+  as.character()
+
+## 3. Collapse all other genres into "Other" for both train and test
+train_reg_rf <- train_reg_rf %>%
+  dplyr::mutate(
+    track_genre = forcats::fct_other(track_genre, keep = top_genres_rf)
+  )
+
+test_reg_rf <- test_reg %>%
+  dplyr::mutate(
+    track_genre = forcats::fct_other(track_genre, keep = top_genres_rf)
+  )
+
+## 4. Fit random forest on the modified, subsampled data
+rf_reg <- randomForest(
+  popularity ~ .,
+  data       = train_reg_rf,
+  ntree      = 150,                             # fewer trees than 300
+  mtry       = floor(sqrt(length(pred_vars))),
+  importance = TRUE,
+  do.trace   = 25                               # prints progress every 25 trees
+)
+
+rf_reg
+varImpPlot(rf_reg)
+
+## 5. Predict and evaluate on full test set
+pred_rf_reg <- predict(rf_reg, newdata = test_reg_rf)
+perf_rf_reg <- reg_metrics(pred_rf_reg, y_test,
+                           paste0("Random forest (n_train=",
+                                  nrow(train_reg_rf), ", ntree=150)"))
+perf_rf_reg
+```
+```{r gbm-reg}
+# Boosted trees (GBM)
+set.seed(123)
+
+# Make sure the required objects exist
+stopifnot(exists("train_reg"), exists("test_reg"), exists("y_test"))
+
+# 1. Subsample training data to speed up GBM
+n_gbm_max <- 20000     # try 10000 or 5000 if still slow
+train_reg_gbm <- if (nrow(train_reg) > n_gbm_max) {
+  dplyr::sample_n(train_reg, n_gbm_max)
+} else {
+  train_reg
+}
+
+# 2. Lighter CV setup
+ctrl_reg_gbm <- trainControl(
+  method      = "cv",
+  number      = 3,          # 3-fold CV instead of 5
+  verboseIter = TRUE        # show progress
+)
+
+# 3. Smaller tuning grid
+gbm_grid <- expand.grid(
+  interaction.depth = c(1, 3),   # shallower trees
+  n.trees           = c(100, 150),
+  shrinkage         = c(0.05),   # single learning rate
+  n.minobsinnode    = 10
+)
+
+# 4. Fit GBM
+set.seed(123)
+gbm_reg <- train(
+  popularity ~ .,
+  data      = train_reg_gbm,
+  method    = "gbm",
+  trControl = ctrl_reg_gbm,
+  tuneGrid  = gbm_grid,
+  verbose   = FALSE
+)
+
+gbm_reg
+
+# 5. Predict and evaluate on full test set
+pred_gbm_reg <- predict(gbm_reg, newdata = test_reg)
+perf_gbm_reg <- reg_metrics(
+  pred_gbm_reg,
+  y_test,
+  paste0("Boosted trees (GBM, n_train = ", nrow(train_reg_gbm), ")")
+)
+perf_gbm_reg
+```
+
+
+# 5 Classification Models: High vs Low Popularity
+
+```{r class-metric-helper}
+# Helper for classification metrics
+class_metrics <- function(pred_class, pred_prob, obs, model_name) {
+  cm <- confusionMatrix(
+    data = pred_class,
+    reference = obs,
+    positive = "High"
+  )
+  roc_obj <- roc(
+    response = obs,
+    predictor = pred_prob,
+    levels = rev(levels(obs))
+  )
+  data.frame(
+    Model       = model_name,
+    Accuracy    = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    AUC         = auc(roc_obj)
+  )
+}
+
+set.seed(123)
+ctrl_class <- trainControl(
+  method = "cv",
+  number = 5,
+  classProbs = TRUE,
+  summaryFunction = twoClassSummary
+)
+```
+
+## 5.1 LDA and QDA
+
+```{r lda-qda}
+# LDA
+set.seed(123)
+lda_fit <- train(
+  high_pop ~ .,
+  data = train_cl,
+  method = "lda",
+  trControl = ctrl_class,
+  metric = "ROC",
+  preProcess = c("center", "scale")
+)
+
+lda_fit
+
+pred_lda_class <- predict(lda_fit, newdata = test_cl)
+pred_lda_prob  <- predict(lda_fit, newdata = test_cl, type = "prob")[, "High"]
+
+perf_lda <- class_metrics(pred_lda_class, pred_lda_prob,
+                          test_cl$high_pop, "LDA")
+perf_lda
+```
+
+```{r qda}
+# QDA on numeric predictors only (to avoid singular covariance issues)
+
+set.seed(123)
+
+# choose numeric predictors for QDA
+qda_num_vars <- c(
+  "duration_ms", "danceability", "energy", "loudness",
+  "speechiness", "acousticness", "instrumentalness",
+  "liveness", "valence", "tempo"
+)
+
+# subset training and test data for QDA
+train_cl_qda <- train_cl %>%
+  dplyr::select(high_pop, all_of(qda_num_vars))
+
+test_cl_qda <- test_cl %>%
+  dplyr::select(high_pop, all_of(qda_num_vars))
+
+# separate control object (ensures classProbs + ROC summary)
+ctrl_class_qda <- trainControl(
+  method        = "cv",
+  number        = 5,
+  classProbs    = TRUE,
+  summaryFunction = twoClassSummary,
+  verboseIter   = TRUE
+)
+
+# fit QDA
+qda_fit <- train(
+  high_pop ~ .,
+  data       = train_cl_qda,
+  method     = "qda",
+  trControl  = ctrl_class_qda,
+  metric     = "ROC",
+  preProcess = c("center", "scale")
+)
+
+qda_fit
+
+# predictions on test set
+pred_qda_class <- predict(qda_fit, newdata = test_cl_qda)
+pred_qda_prob  <- predict(qda_fit, newdata = test_cl_qda, type = "prob")[, "High"]
+
+# performance metrics
+perf_qda <- class_metrics(
+  pred_qda_class,
+  pred_qda_prob,
+  test_cl_qda$high_pop,
+  "QDA"
+)
+
+perf_qda
+```
+
+## 5.2 Naive Bayes
+
+```{r nb}
+set.seed(123)
+
+# Make sure e1071 is loaded (you already loaded it earlier, but be explicit)
+library(e1071)
+
+# Use only numeric predictors for Naive Bayes (simpler, more stable)
+nb_vars <- c(
+  "duration_ms", "danceability", "energy", "loudness",
+  "speechiness", "acousticness", "instrumentalness",
+  "liveness", "valence", "tempo"
+)
+
+train_cl_nb <- train_cl %>%
+  dplyr::select(high_pop, all_of(nb_vars))
+
+test_cl_nb <- test_cl %>%
+  dplyr::select(high_pop, all_of(nb_vars))
+
+# Fit Naive Bayes with e1071 (no caret, no klaR)
+nb_fit <- naiveBayes(
+  high_pop ~ .,
+  data = train_cl_nb
+)
+
+nb_fit
+
+# Predictions on test set
+pred_nb_class <- predict(nb_fit, newdata = test_cl_nb, type = "class")
+pred_nb_prob  <- predict(nb_fit, newdata = test_cl_nb, type = "raw")[, "High"]
+
+# Performance metrics using your helper
+perf_nb <- class_metrics(
+  pred_nb_class,
+  pred_nb_prob,
+  test_cl_nb$high_pop,
+  "Naive Bayes (e1071)"
+)
+
+perf_nb
+
+```
+
+## 5.3 kNN Classification
+
+```{r knn-class}
+set.seed(123)
+
+# 1. Subsample training data for speed
+n_knn_cl_max <- 5000   # try 3000 or 2000 if still slow
+train_cl_knn <- if (nrow(train_cl) > n_knn_cl_max) {
+  dplyr::sample_n(train_cl, n_knn_cl_max)
+} else {
+  train_cl
+}
+
+# 2. Lighter CV setup (still ROC-based)
+ctrl_class_knn <- trainControl(
+  method         = "cv",
+  number         = 3,              # 3-fold instead of 5
+  classProbs     = TRUE,
+  summaryFunction = twoClassSummary,
+  verboseIter    = TRUE            # print progress
+)
+
+# 3. Smaller tuning grid for k
+knn_grid <- data.frame(k = c(5, 15, 25))
+
+# 4. Fit kNN classifier
+knn_cl_fit <- train(
+  high_pop ~ .,
+  data       = train_cl_knn,
+  method     = "knn",
+  trControl  = ctrl_class_knn,
+  metric     = "ROC",
+  preProcess = c("center", "scale"),
+  tuneGrid   = knn_grid
+)
+
+knn_cl_fit
+
+# 5. Predict on full test set and evaluate
+pred_knn_class <- predict(knn_cl_fit, newdata = test_cl)
+pred_knn_prob  <- predict(knn_cl_fit, newdata = test_cl, type = "prob")[, "High"]
+
+perf_knn_cl <- class_metrics(
+  pred_knn_class,
+  pred_knn_prob,
+  test_cl$high_pop,
+  paste0("kNN classification (n_train=", nrow(train_cl_knn), ")")
+)
+
+perf_knn_cl
+```
+
+## 5.4 Tree-based Classification: CART, GBM
+
+```{r tree-class}
+# Classification tree (CART)
+set.seed(123)
+tree_cl_fit <- train(
+  high_pop ~ .,
+  data = train_cl,
+  method = "rpart",
+  trControl = ctrl_class,
+  metric = "ROC",
+  tuneLength = 10
+)
+
+tree_cl_fit
+rpart.plot(tree_cl_fit$finalModel, main = "Classification Tree")
+
+pred_tree_cl   <- predict(tree_cl_fit, newdata = test_cl)
+pred_tree_prob <- predict(tree_cl_fit, newdata = test_cl, type = "prob")[, "High"]
+
+perf_tree_cl <- class_metrics(pred_tree_cl, pred_tree_prob,
+                              test_cl$high_pop, "Classification tree")
+perf_tree_cl
+```
+
+```{r gbm-class}
+# Boosted trees (GBM)
+set.seed(123)
+
+# 1. Subsample training data for speed
+n_gbm_cl_max <- 20000   # try 10000 or 5000 if still slow
+train_cl_gbm <- if (nrow(train_cl) > n_gbm_cl_max) {
+  dplyr::sample_n(train_cl, n_gbm_cl_max)
+} else {
+  train_cl
+}
+
+# 2. Lighter CV setup
+ctrl_gbm_cl <- trainControl(
+  method         = "cv",
+  number         = 3,              # 3-fold instead of 5
+  classProbs     = TRUE,
+  summaryFunction = twoClassSummary,
+  verboseIter    = TRUE            # show progress in console
+)
+
+# 3. Small tuning grid (few combinations)
+gbm_grid_cl <- expand.grid(
+  interaction.depth = c(1, 3),     # shallow & medium trees
+  n.trees           = c(100, 150), # fewer trees
+  shrinkage         = c(0.05),     # single learning rate
+  n.minobsinnode    = 10
+)
+
+# 4. Fit GBM classifier
+gbm_cl_fit <- train(
+  high_pop ~ .,
+  data      = train_cl_gbm,
+  method    = "gbm",
+  trControl = ctrl_gbm_cl,
+  metric    = "ROC",
+  tuneGrid  = gbm_grid_cl,
+  verbose   = FALSE
+)
+
+gbm_cl_fit
+
+# 5. Predict on full test set and evaluate
+pred_gbm_cl  <- predict(gbm_cl_fit, newdata = test_cl)
+pred_gbm_prob <- predict(gbm_cl_fit, newdata = test_cl, type = "prob")[, "High"]
+
+perf_gbm_cl <- class_metrics(
+  pred_gbm_cl,
+  pred_gbm_prob,
+  test_cl$high_pop,
+  paste0("Boosted trees (GBM, n_train=", nrow(train_cl_gbm), ")")
+)
+
+perf_gbm_cl
+```
+
+# 6 Model Comparison and Validation
+
+## 6.1 Regression model comparison
+
+```{r reg-summary}
+reg_results <- bind_rows(
+  perf_lm_simple,
+  perf_lm_full,
+  perf_step_aic,
+  perf_step_bic,
+  perf_ridge,
+  perf_lasso,
+  perf_pcr,
+  perf_knn_reg,
+  perf_tree_reg,
+  perf_rf_reg,
+  perf_gbm_reg
+)
+
+reg_results
+```
+
+## 6.2 Classification model comparison
+```{r class-metrics-and-summary}
+# Updated helper: make AUC numeric so bind_rows() is happy
+class_metrics <- function(pred_class, pred_prob, obs, model_name) {
+  cm <- confusionMatrix(
+    data = pred_class,
+    reference = obs,
+    positive = "High"
+  )
+  roc_obj <- roc(
+    response = obs,
+    predictor = pred_prob,
+    levels = rev(levels(obs))
+  )
+  data.frame(
+    Model       = model_name,
+    Accuracy    = cm$overall["Accuracy"],
+    Sensitivity = cm$byClass["Sensitivity"],
+    Specificity = cm$byClass["Specificity"],
+    AUC         = as.numeric(auc(roc_obj))  # <- force numeric
+  )
+}
+
+# If the perf_* objects already exist, make sure their AUC is numeric
+if (exists("perf_lda"))     perf_lda$AUC    <- as.numeric(perf_lda$AUC)
+if (exists("perf_qda"))     perf_qda$AUC    <- as.numeric(perf_qda$AUC)
+if (exists("perf_nb"))      perf_nb$AUC     <- as.numeric(perf_nb$AUC)
+if (exists("perf_knn_cl"))  perf_knn_cl$AUC <- as.numeric(perf_knn_cl$AUC)
+if (exists("perf_tree_cl")) perf_tree_cl$AUC<- as.numeric(perf_tree_cl$AUC)
+if (exists("perf_gbm_cl"))  perf_gbm_cl$AUC <- as.numeric(perf_gbm_cl$AUC)
+
+# Build the classification results table
+class_results <- dplyr::bind_rows(
+  perf_lda,
+  perf_qda,      # if you decide not to use QDA, comment this line out
+  perf_nb,
+  perf_knn_cl,
+  perf_tree_cl,
+  perf_gbm_cl
+)
+
+class_results
+```
+
+```{r class-summary}
+class_results <- bind_rows(
+  perf_lda,
+  perf_qda,
+  perf_nb,
+  perf_knn_cl,
+  perf_tree_cl,
+  perf_gbm_cl
+)
+
+class_results
+```
+
+## 6.3 Example: Bootstrap CIs for linear model coefficients (optional)
+
+```{r bootstrap-ci, eval=FALSE}
+set.seed(123)
+B <- 200
+coef_mat <- matrix(NA, nrow = B, ncol = length(coef(lm_full)))
+colnames(coef_mat) <- names(coef(lm_full))
+
+for (b in 1:B) {
+  boot_idx <- sample(seq_len(nrow(train_reg)), replace = TRUE)
+  boot_fit <- lm(popularity ~ ., data = train_reg[boot_idx, ])
+  coef_mat[b, ] <- coef(boot_fit)
+}
+
+boot_ci <- apply(coef_mat, 2, quantile, probs = c(0.025, 0.975), na.rm = TRUE)
+t(boot_ci)
+```
+
